@@ -1,0 +1,9 @@
+{
+  "input": {
+    "image": "https://raw.githubusercontent.com/bilibili/ailab/main/Real-CUGAN/demos/comic.jpg",
+    "scale": 2,
+    "denoise": "conservative",
+    "tile_mode": "auto",
+    "upload_destination": "catbox"
+  }
+}

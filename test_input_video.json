@@ -1,0 +1,10 @@
+{
+  "input": {
+    "video": "https://raw.githubusercontent.com/bilibili/ailab/main/Real-CUGAN/demos/432126871-clip6s.mp4",
+    "scale": 2,
+    "denoise": "conservative",
+    "tile_mode": "auto",
+    "crf": 18,
+    "upload_destination": "catbox"
+  }
+}
