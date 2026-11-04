@@ -59,11 +59,13 @@ RUN python3 -m pip install --no-cache-dir \
 COPY download_models.py /app/download_models.py
 RUN python3 /app/download_models.py
 
-# 5. Copy handler, model architecture, and documentation
+# 5. Copy handler, start script, model architecture, and documentation
 COPY upcunet_v3.py /app/upcunet_v3.py
 COPY handler.py /app/handler.py
+COPY start.sh /start.sh
 COPY README.md /app/README.md
 
-RUN python3 -m compileall -q /app /usr/local/lib/python3.11/dist-packages || true
+RUN chmod +x /start.sh \
+    && python3 -m compileall -q /app /usr/local/lib/python3.11/dist-packages || true
 
-CMD ["python3", "-u", "/app/handler.py"]
+ENTRYPOINT ["/start.sh"]
