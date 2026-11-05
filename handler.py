@@ -547,7 +547,9 @@ def process_video(
     except Exception as e:
         print(f"[{job_id}] Audio extraction check failed ({e}), proceeding without audio...", flush=True)
 
-    # 2. Build FFmpeg command to read raw BGR frames from stdin
+    # 2. Build Stage 1 FFmpeg command: encode pure video stream from stdin to temporary file.
+    # Writing pure video without audio avoids libx264 lookahead buffer truncation from pipe -shortest race conditions.
+    temp_video = os.path.join(os.path.dirname(output_path), f"temp_video_{uuid.uuid4().hex[:6]}.mp4")
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo",
@@ -556,31 +558,16 @@ def process_video(
         "-pix_fmt", "bgr24",
         "-r", str(fps),
         "-i", "-",  # Read from stdin
-    ]
-
-    if has_audio and temp_audio and os.path.isfile(temp_audio):
-        ffmpeg_cmd.extend([
-            "-i", temp_audio,
-            "-map", "0:v:0",
-            "-map", "1:a:0?",
-            "-c:a", "copy",
-            "-shortest",
-        ])
-    else:
-        ffmpeg_cmd.extend([
-            "-map", "0:v:0",
-        ])
-
-    ffmpeg_cmd.extend([
+        "-an",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-preset", "fast",
         "-crf", str(crf),
         "-movflags", "+faststart",
-        output_path,
-    ])
+        temp_video,
+    ]
 
-    print(f"[{job_id}] Launching FFmpeg encoder process...", flush=True)
+    print(f"[{job_id}] Launching FFmpeg encoder process (Stage 1: pure video stream)...", flush=True)
     proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     # 3. Stream frames through Real-CUGAN into FFmpeg pipe
@@ -588,33 +575,34 @@ def process_video(
     t_loop = time.time()
 
     try:
-        while True:
-            ret, bgr_frame = cap.read()
-            if not ret or bgr_frame is None:
-                break
+        with torch.inference_mode():
+            while True:
+                ret, bgr_frame = cap.read()
+                if not ret or bgr_frame is None:
+                    break
 
-            rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-            upscaled_rgb = upscaler(rgb_frame, tile_mode=effective_tile, cache_mode=cache_mode, alpha=alpha)
-            upscaled_bgr = cv2.cvtColor(upscaled_rgb, cv2.COLOR_RGB2BGR)
+                rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+                upscaled_rgb = upscaler(rgb_frame, tile_mode=effective_tile, cache_mode=cache_mode, alpha=alpha)
+                upscaled_bgr = cv2.cvtColor(upscaled_rgb, cv2.COLOR_RGB2BGR)
 
-            # Ensure exact target dimensions match ffmpeg -s {out_w}x{out_h}
-            if upscaled_bgr.shape[0] != out_h or upscaled_bgr.shape[1] != out_w:
-                upscaled_bgr = cv2.resize(upscaled_bgr, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+                # Ensure exact target dimensions match ffmpeg -s {out_w}x{out_h}
+                if upscaled_bgr.shape[0] != out_h or upscaled_bgr.shape[1] != out_w:
+                    upscaled_bgr = cv2.resize(upscaled_bgr, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
 
-            # Write raw frame buffer directly to FFmpeg stdin
-            try:
-                proc.stdin.write(upscaled_bgr.tobytes())
-            except (BrokenPipeError, IOError):
-                print(f"[{job_id}] FFmpeg pipe closed prematurely.", flush=True)
-                break
+                # Write raw frame buffer directly to FFmpeg stdin
+                try:
+                    proc.stdin.write(upscaled_bgr.tobytes())
+                except (BrokenPipeError, IOError):
+                    print(f"[{job_id}] FFmpeg pipe closed prematurely.", flush=True)
+                    break
 
-            frames_processed += 1
+                frames_processed += 1
 
-            if frames_processed % 30 == 0 or frames_processed == total_frames:
-                elapsed = time.time() - t_loop
-                fps_rate = frames_processed / max(0.001, elapsed)
-                pct = (frames_processed / total_frames * 100) if total_frames > 0 else 0
-                print(f"[{job_id}] Processed {frames_processed}/{total_frames} frames ({pct:.1f}%) — {fps_rate:.1f} FPS", flush=True)
+                if frames_processed % 30 == 0 or frames_processed == total_frames:
+                    elapsed = time.time() - t_loop
+                    fps_rate = frames_processed / max(0.001, elapsed)
+                    pct = (frames_processed / total_frames * 100) if total_frames > 0 else 0
+                    print(f"[{job_id}] Processed {frames_processed}/{total_frames} frames ({pct:.1f}%) — {fps_rate:.1f} FPS", flush=True)
 
     finally:
         cap.release()
@@ -638,8 +626,65 @@ def process_video(
 
         if proc.returncode != 0:
             print(f"[{job_id}] FFmpeg error (exit code {proc.returncode}): {stderr_text[-500:]}", flush=True)
+            if os.path.isfile(temp_video):
+                try:
+                    os.remove(temp_video)
+                except Exception:
+                    pass
+            if temp_audio and os.path.isfile(temp_audio):
+                try:
+                    os.remove(temp_audio)
+                except Exception:
+                    pass
             raise RuntimeError(f"FFmpeg encoding failed with exit code {proc.returncode}: {stderr_text[-300:]}")
 
+    # 4. Stage 2: Losslessly combine video with audio if audio was present
+    try:
+        if has_audio and temp_audio and os.path.isfile(temp_audio):
+            print(f"[{job_id}] Stage 2: Remuxing video and audio streams losslessly...", flush=True)
+            video_dur = frames_processed / fps if fps > 0 else None
+            mux_cmd = [
+                "ffmpeg", "-y",
+                "-i", temp_video,
+                "-i", temp_audio,
+                "-c:v", "copy",
+                "-c:a", "copy",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+            ]
+            if video_dur and video_dur > 0:
+                mux_cmd.extend(["-t", f"{video_dur:.4f}"])
+            mux_cmd.extend(["-movflags", "+faststart", output_path])
+
+            mux_res = subprocess.run(mux_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if mux_res.returncode != 0:
+                # Fallback to AAC transcode in case audio stream copy fails
+                mux_cmd_fb = [
+                    "ffmpeg", "-y",
+                    "-i", temp_video,
+                    "-i", temp_audio,
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-b:a", "256k",
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                ]
+                if video_dur and video_dur > 0:
+                    mux_cmd_fb.extend(["-t", f"{video_dur:.4f}"])
+                mux_cmd_fb.extend(["-movflags", "+faststart", output_path])
+                mux_res_fb = subprocess.run(mux_cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if mux_res_fb.returncode != 0:
+                    err_fb = mux_res_fb.stderr.decode("utf-8", errors="ignore")
+                    print(f"[{job_id}] Audio remux fallback failed ({err_fb[-300:]}), keeping video without audio", flush=True)
+                    shutil.move(temp_video, output_path)
+        else:
+            shutil.move(temp_video, output_path)
+    finally:
+        if os.path.isfile(temp_video):
+            try:
+                os.remove(temp_video)
+            except Exception:
+                pass
         if temp_audio and os.path.isfile(temp_audio):
             try:
                 os.remove(temp_audio)
