@@ -9,11 +9,18 @@ Features:
   - Scales: 2x, 3x, 4x
   - Denoise modes: conservative, no-denoise, 1x, 2x, 3x
   - Automatic dynamic tiling to prevent Out-Of-Memory (OOM) on 2K/4K resolutions
-  - Multi-destination upload: Backblaze B2, Catbox.moe, Uguu.se, or direct Base64
+  - Multi-destination upload: Backblaze B2, Uguu.se, Tmpfiles.org, Catbox.moe, or direct Base64
 """
 
 import os
 import sys
+
+# Ensure immediate line-buffered logging on Docker / RunPod daemon
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "0")
@@ -43,7 +50,7 @@ if torch.cuda.is_available():
         _gpu_name = torch.cuda.get_device_name(0)
         _gpu_cap = torch.cuda.get_device_capability(0)
         _vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        print(f"🚀 Active GPU: {_gpu_name} (sm_{_gpu_cap[0]}{_gpu_cap[1]}, {_vram_gb:.2f} GB VRAM) — PyTorch {torch.__version__}")
+        print(f"🚀 Active GPU: {_gpu_name} (sm_{_gpu_cap[0]}{_gpu_cap[1]}, {_vram_gb:.2f} GB VRAM) — PyTorch {torch.__version__}", flush=True)
     except Exception:
         pass
 
@@ -54,6 +61,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEIGHTS_DIR = os.environ.get("WEIGHTS_DIR", os.path.join(BASE_DIR, "weights_v3"))
 DEFAULT_CATBOX_USER_HASH = os.environ.get("CATBOX_USER_HASH", "")
 MAX_CONCURRENCY = max(1, int(os.environ.get("MAX_CONCURRENCY", "1")))
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 # Global in-memory cache for loaded model instances
 UPSCALER_CACHE = {}
@@ -98,15 +106,24 @@ def resolve_model_path(scale: int, denoise: str) -> str:
         else:
             fname = "up4x-latest-denoise3x.pth"
 
-    full_path = os.path.join(WEIGHTS_DIR, fname)
-    if not os.path.isfile(full_path):
-        # Fallback search if weights are in current directory
-        alt_path = os.path.join(BASE_DIR, fname)
-        if os.path.isfile(alt_path):
-            return alt_path
-        raise FileNotFoundError(f"Real-CUGAN model weight not found: {full_path}. Run download_models.py first.")
+    candidates = [
+        os.path.join(WEIGHTS_DIR, fname),
+        os.path.join("/app", "weights_v3", fname),
+        os.path.join(BASE_DIR, "weights_v3", fname),
+        os.path.join("/workspace", "weights_v3", fname),
+        os.path.join("/runpod-volume", "weights_v3", fname),
+        os.path.join(BASE_DIR, fname),
+        os.path.join(os.getcwd(), "weights_v3", fname),
+        os.path.join(os.getcwd(), fname),
+    ]
 
-    return full_path
+    for p in candidates:
+        if os.path.isfile(p) and os.path.getsize(p) > 1024 * 1024:
+            return p
+
+    raise FileNotFoundError(
+        f"Real-CUGAN model weight not found for {fname}. Checked: {candidates[:4]}. Run download_models.py first."
+    )
 
 
 def get_upscaler(scale: int, denoise: str, half: bool = True, device: str = "cuda:0") -> RealWaifuUpScaler:
@@ -121,10 +138,10 @@ def get_upscaler(scale: int, denoise: str, half: bool = True, device: str = "cud
     if cache_key in UPSCALER_CACHE:
         return UPSCALER_CACHE[cache_key]
 
-    print(f"⚡ Loading Real-CUGAN {scale}x ({os.path.basename(weight_path)}) [half={half}, device={device}]...")
+    print(f"⚡ Loading Real-CUGAN {scale}x ({os.path.basename(weight_path)}) [half={half}, device={device}]...", flush=True)
     t0 = time.time()
     upscaler = RealWaifuUpScaler(scale=scale, weight_path=weight_path, half=half, device=device)
-    print(f"✅ Loaded {os.path.basename(weight_path)} in {time.time() - t0:.2f}s")
+    print(f"✅ Loaded {os.path.basename(weight_path)} in {time.time() - t0:.2f}s", flush=True)
 
     UPSCALER_CACHE[cache_key] = upscaler
     return upscaler
@@ -157,7 +174,7 @@ def determine_tile_mode(width: int, height: int, user_tile_mode=None) -> int:
 
 
 # ==============================================================================
-# Cloud Upload Utilities (Backblaze B2, Catbox.moe, Uguu.se)
+# Cloud Upload Utilities (Backblaze B2, Uguu.se, Tmpfiles.org, Catbox.moe)
 # ==============================================================================
 def upload_b2(file_path: str, folder: str = "cugan") -> str:
     """Upload to Backblaze B2 (boto3 S3 or native REST)."""
@@ -200,35 +217,16 @@ def upload_b2(file_path: str, folder: str = "cugan") -> str:
         return f"{parsed.scheme}://{bucket}.{parsed.netloc}/{target_key}"
 
 
-def upload_catbox(file_path: str, user_hash: str = None) -> str:
-    """Upload to Catbox.moe (files up to 200MB)."""
-    data = {"reqtype": "fileupload"}
-    h = user_hash or DEFAULT_CATBOX_USER_HASH
-    if h:
-        data["userhash"] = h
-
-    with open(file_path, "rb") as f:
-        resp = requests.post(
-            "https://catbox.moe/user/api.php",
-            data=data,
-            files={"fileToUpload": (os.path.basename(file_path), f)},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        url = resp.text.strip()
-        if url.startswith("http"):
-            return url
-        raise ValueError(f"Catbox upload failed: {resp.text}")
-
-
 def upload_uguu(file_path: str) -> str:
     """Upload to Uguu.se (files up to 100MB)."""
+    headers = {"User-Agent": BROWSER_UA}
     with open(file_path, "rb") as f:
         resp = requests.post(
             "https://uguu.se/upload",
             params={"output": "json"},
             files={"files[]": (os.path.basename(file_path), f)},
-            timeout=120,
+            headers=headers,
+            timeout=180,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -238,29 +236,108 @@ def upload_uguu(file_path: str) -> str:
         raise ValueError(f"Uguu response invalid: {data}")
 
 
+def upload_tmpfiles(file_path: str) -> str:
+    """Upload to Tmpfiles.org (files up to 10GB)."""
+    headers = {"User-Agent": BROWSER_UA}
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            "https://tmpfiles.org/api/v1/upload",
+            files={"file": (os.path.basename(file_path), f)},
+            headers=headers,
+            timeout=180,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") == "success" and "data" in data and "url" in data["data"]:
+            url = data["data"]["url"]
+            return url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+        raise ValueError(f"Tmpfiles upload failed: {data}")
+
+
+def upload_catbox(file_path: str, user_hash: str = None) -> str:
+    """Upload to Catbox.moe (files up to 200MB)."""
+    data = {"reqtype": "fileupload"}
+    h = user_hash or DEFAULT_CATBOX_USER_HASH
+    if h:
+        data["userhash"] = h
+
+    headers = {"User-Agent": BROWSER_UA}
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            "https://catbox.moe/user/api.php",
+            data=data,
+            files={"fileToUpload": (os.path.basename(file_path), f)},
+            headers=headers,
+            timeout=180,
+        )
+        resp.raise_for_status()
+        url = resp.text.strip()
+        if url.startswith("http"):
+            return url
+        raise ValueError(f"Catbox upload failed: {resp.text}")
+
+
 def upload_file_auto(file_path: str, destination: str = "auto") -> str:
-    """Upload output file to requested destination or auto-fallback."""
+    """Upload output file to requested destination or auto-fallback chain."""
     dest = (destination or "auto").strip().lower()
 
     if dest == "b2":
         return upload_b2(file_path)
-    if dest == "uguu":
-        return upload_uguu(file_path)
-    if dest == "catbox":
-        return upload_catbox(file_path)
 
-    # Auto mode: try B2 if configured, fallback to Catbox, then Uguu
+    # If Uguu requested specifically
+    if dest == "uguu":
+        try:
+            return upload_uguu(file_path)
+        except Exception as e:
+            print(f"⚠️ Uguu upload failed ({e}), trying tmpfiles fallback...", flush=True)
+            try:
+                return upload_tmpfiles(file_path)
+            except Exception:
+                return upload_catbox(file_path)
+
+    # If Catbox requested specifically
+    if dest == "catbox":
+        try:
+            return upload_catbox(file_path)
+        except Exception as e:
+            print(f"⚠️ Catbox upload failed ({e}), falling back to Uguu...", flush=True)
+            try:
+                return upload_uguu(file_path)
+            except Exception:
+                return upload_tmpfiles(file_path)
+
+    # If Tmpfiles requested specifically
+    if dest in ("tmpfiles", "tmpfile"):
+        try:
+            return upload_tmpfiles(file_path)
+        except Exception as e:
+            print(f"⚠️ Tmpfiles upload failed ({e}), trying Uguu fallback...", flush=True)
+            return upload_uguu(file_path)
+
+    # Auto mode: try B2 if configured, then Uguu, then tmpfiles, then Catbox
     if os.environ.get("B2_KEY_ID") and os.environ.get("B2_BUCKET_NAME"):
         try:
             return upload_b2(file_path)
         except Exception as e:
-            print(f"⚠️ B2 upload failed ({e}), falling back to Catbox...")
+            print(f"⚠️ B2 upload failed ({e}), falling back to Uguu...", flush=True)
 
+    # Try Uguu first
+    try:
+        return upload_uguu(file_path)
+    except Exception as e1:
+        print(f"⚠️ Uguu upload failed ({e1}), trying tmpfiles...", flush=True)
+
+    # Try tmpfiles second
+    try:
+        return upload_tmpfiles(file_path)
+    except Exception as e2:
+        print(f"⚠️ Tmpfiles upload failed ({e2}), trying Catbox...", flush=True)
+
+    # Try Catbox third
     try:
         return upload_catbox(file_path)
-    except Exception as e1:
-        print(f"⚠️ Catbox upload failed ({e1}), falling back to Uguu...")
-        return upload_uguu(file_path)
+    except Exception as e3:
+        raise RuntimeError(f"All cloud upload providers failed: Uguu ({e1}), Tmpfiles ({e2}), Catbox ({e3})")
 
 
 # ==============================================================================
@@ -302,8 +379,9 @@ def download_or_decode_media(raw_input: str, temp_dir: str) -> tuple[str, str]:
             ext = ".tmp"
 
         out_path = os.path.join(temp_dir, f"input_{uuid.uuid4().hex[:8]}{ext}")
-        print(f"⬇️ Downloading input from {raw}...")
-        resp = requests.get(raw, stream=True, timeout=120)
+        print(f"⬇️ Downloading input from {raw}...", flush=True)
+        headers = {"User-Agent": BROWSER_UA}
+        resp = requests.get(raw, stream=True, timeout=(15, 300), headers=headers)
         resp.raise_for_status()
 
         # Check content-type header if extension was ambiguous
@@ -311,8 +389,12 @@ def download_or_decode_media(raw_input: str, temp_dir: str) -> tuple[str, str]:
         if media_type == "unknown":
             if "video" in ctype:
                 media_type = "video"
+                ext = ".mp4"
             else:
                 media_type = "image"
+                ext = ".png"
+            new_path = os.path.splitext(out_path)[0] + ext
+            out_path = new_path
 
         with open(out_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
@@ -323,7 +405,6 @@ def download_or_decode_media(raw_input: str, temp_dir: str) -> tuple[str, str]:
 
     # 3. Raw Base64 string
     decoded = base64.b64decode(raw)
-    # Inspect first few bytes for common signatures
     if decoded.startswith(b"\x89PNG") or decoded.startswith(b"\xff\xd8\xff") or b"WEBP" in decoded[:16]:
         media_type = "image"
         ext = ".png"
@@ -431,12 +512,13 @@ def process_video(
     if custom_fps and custom_fps > 0:
         fps = float(custom_fps)
 
-    out_w = in_w * scale
-    out_h = in_h * scale
+    # Force even dimensions for H.264 yuv420p encoder compatibility
+    out_w = ((in_w * scale) // 2) * 2
+    out_h = ((in_h * scale) // 2) * 2
 
     effective_tile = determine_tile_mode(in_w, in_h, tile_mode)
 
-    print(f"[{job_id}] Video Info: {in_w}x{in_h} @ {fps:.2f}fps ({total_frames} frames) -> Target: {out_w}x{out_h} (scale={scale}x, tile={effective_tile})")
+    print(f"[{job_id}] Video Info: {in_w}x{in_h} @ {fps:.2f}fps ({total_frames} frames) -> Target: {out_w}x{out_h} (scale={scale}x, tile={effective_tile})", flush=True)
 
     # 1. Extract audio losslessly to temporary file if audio stream exists
     temp_audio = None
@@ -447,7 +529,7 @@ def process_video(
             "-select_streams", "a:0",
             "-show_entries", "stream=codec_name",
             "-of", "default=noprint_wrappers=1:nokey=1",
-            input_path
+            input_path,
         ]
         probe_res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if probe_res.stdout.strip():
@@ -463,7 +545,7 @@ def process_video(
                 if ext_aac.returncode == 0 and os.path.isfile(temp_audio) and os.path.getsize(temp_audio) > 0:
                     has_audio = True
     except Exception as e:
-        print(f"[{job_id}] Audio extraction check failed ({e}), proceeding without audio...")
+        print(f"[{job_id}] Audio extraction check failed ({e}), proceeding without audio...", flush=True)
 
     # 2. Build FFmpeg command to read raw BGR frames from stdin
     ffmpeg_cmd = [
@@ -477,7 +559,17 @@ def process_video(
     ]
 
     if has_audio and temp_audio and os.path.isfile(temp_audio):
-        ffmpeg_cmd.extend(["-i", temp_audio, "-c:a", "copy"])
+        ffmpeg_cmd.extend([
+            "-i", temp_audio,
+            "-map", "0:v:0",
+            "-map", "1:a:0?",
+            "-c:a", "copy",
+            "-shortest",
+        ])
+    else:
+        ffmpeg_cmd.extend([
+            "-map", "0:v:0",
+        ])
 
     ffmpeg_cmd.extend([
         "-c:v", "libx264",
@@ -485,10 +577,10 @@ def process_video(
         "-preset", "fast",
         "-crf", str(crf),
         "-movflags", "+faststart",
-        output_path
+        output_path,
     ])
 
-    print(f"[{job_id}] Launching FFmpeg encoder process...")
+    print(f"[{job_id}] Launching FFmpeg encoder process...", flush=True)
     proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     # 3. Stream frames through Real-CUGAN into FFmpeg pipe
@@ -505,26 +597,48 @@ def process_video(
             upscaled_rgb = upscaler(rgb_frame, tile_mode=effective_tile, cache_mode=cache_mode, alpha=alpha)
             upscaled_bgr = cv2.cvtColor(upscaled_rgb, cv2.COLOR_RGB2BGR)
 
+            # Ensure exact target dimensions match ffmpeg -s {out_w}x{out_h}
+            if upscaled_bgr.shape[0] != out_h or upscaled_bgr.shape[1] != out_w:
+                upscaled_bgr = cv2.resize(upscaled_bgr, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+
             # Write raw frame buffer directly to FFmpeg stdin
-            proc.stdin.write(upscaled_bgr.tobytes())
+            try:
+                proc.stdin.write(upscaled_bgr.tobytes())
+            except (BrokenPipeError, IOError):
+                print(f"[{job_id}] FFmpeg pipe closed prematurely.", flush=True)
+                break
+
             frames_processed += 1
 
             if frames_processed % 30 == 0 or frames_processed == total_frames:
                 elapsed = time.time() - t_loop
                 fps_rate = frames_processed / max(0.001, elapsed)
                 pct = (frames_processed / total_frames * 100) if total_frames > 0 else 0
-                print(f"[{job_id}] Processed {frames_processed}/{total_frames} frames ({pct:.1f}%) — {fps_rate:.1f} FPS")
+                print(f"[{job_id}] Processed {frames_processed}/{total_frames} frames ({pct:.1f}%) — {fps_rate:.1f} FPS", flush=True)
 
     finally:
         cap.release()
+        stderr_text = ""
         try:
-            proc.stdin.close()
-        except Exception:
-            pass
-        _, stderr = proc.communicate()
+            # DO NOT call proc.stdin.close() manually before communicate()!
+            # In Python 3.11+, communicate() automatically flushes and closes stdin cleanly.
+            _, stderr_bytes = proc.communicate(timeout=180)
+            if stderr_bytes:
+                stderr_text = stderr_bytes.decode("utf-8", errors="ignore")
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, stderr_bytes = proc.communicate()
+            stderr_text = stderr_bytes.decode("utf-8", errors="ignore") if stderr_bytes else "FFmpeg timed out"
+        except Exception as comm_err:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            stderr_text = str(comm_err)
+
         if proc.returncode != 0:
-            print(f"[{job_id}] FFmpeg error: {stderr.decode('utf-8', errors='ignore')[-500:]}")
-            raise RuntimeError("FFmpeg encoding failed.")
+            print(f"[{job_id}] FFmpeg error (exit code {proc.returncode}): {stderr_text[-500:]}", flush=True)
+            raise RuntimeError(f"FFmpeg encoding failed with exit code {proc.returncode}: {stderr_text[-300:]}")
 
         if temp_audio and os.path.isfile(temp_audio):
             try:
@@ -553,7 +667,7 @@ def handler(job: dict) -> dict:
     job_id = job.get("id", str(uuid.uuid4()))
     job_input = job.get("input", {})
 
-    print(f"\n⚡ [{job_id}] Received job request")
+    print(f"\n⚡ [{job_id}] Received job request", flush=True)
 
     # 1. Parse Input Parameters
     raw_media = (
@@ -585,7 +699,7 @@ def handler(job: dict) -> dict:
     try:
         # 3. Ingest Media
         input_file, detected_type = download_or_decode_media(raw_media, temp_dir)
-        print(f"[{job_id}] Input media detected as '{detected_type}' -> {input_file}")
+        print(f"[{job_id}] Input media detected as '{detected_type}' -> {input_file}", flush=True)
 
         # 4. Initialize Upscaler
         upscaler = get_upscaler(scale=scale, denoise=denoise, half=half)
@@ -641,10 +755,10 @@ def handler(job: dict) -> dict:
                 output_response["base64"] = base64.b64encode(f.read()).decode("utf-8")
         else:
             # Upload to cloud
-            print(f"[{job_id}] Uploading output ({size_bytes / (1024*1024):.2f} MB) to {upload_dest}...")
+            print(f"[{job_id}] Uploading output ({size_bytes / (1024*1024):.2f} MB) with dest '{upload_dest}'...", flush=True)
             upload_url = upload_file_auto(output_file, destination=upload_dest)
             output_response["url"] = upload_url
-            print(f"[{job_id}] Uploaded successfully: {upload_url}")
+            print(f"[{job_id}] Uploaded successfully: {upload_url}", flush=True)
 
             # For images under 5MB, also attach base64 for zero-download instant display
             if media_type == "image" and size_bytes < 5 * 1024 * 1024:
@@ -654,7 +768,7 @@ def handler(job: dict) -> dict:
         return output_response
 
     except Exception as e:
-        print(f"❌ [{job_id}] Error: {e}")
+        print(f"❌ [{job_id}] Error: {e}", flush=True)
         traceback.print_exc()
         return {"error": str(e), "traceback": traceback.format_exc()}
 
@@ -663,7 +777,7 @@ def handler(job: dict) -> dict:
 
 
 if __name__ == "__main__":
-    print("🚀 Starting Real-CUGAN Serverless Worker...")
+    print("🚀 Starting Real-CUGAN Serverless Worker...", flush=True)
     runpod.serverless.start(
         {
             "handler": handler,

@@ -278,12 +278,12 @@ class UpCunet2x(nn.Module):
                 crop_size_w=(w0-1)//2*2+2#能被2整除
             crop_size=(crop_size_h,crop_size_w)
         elif(tile_mode>=2):
-            tile_mode=min(min(h0,w0)//128,int(tile_mode))#最小短边为128*128
-            t2=tile_mode*2
-            crop_size=(((h0-1)//t2*t2+t2)//tile_mode,((w0-1)//t2*t2+t2)//tile_mode)
+            safe_limit = max(2, min(h0, w0) // 128)
+            tile_mode = max(2, min(safe_limit, int(tile_mode)))
+            t2 = tile_mode * 2
+            crop_size = (((h0 - 1) // t2 * t2 + t2) // tile_mode, ((w0 - 1) // t2 * t2 + t2) // tile_mode)
         else:
-            print("tile_mode config error")
-            os._exit(233)
+            raise ValueError(f"Invalid tile_mode config: {tile_mode}")
 
         ph = ((h0 - 1) // crop_size[0] + 1) * crop_size[0]
         pw = ((w0 - 1) // crop_size[1] + 1) * crop_size[1]
@@ -404,12 +404,12 @@ class UpCunet2x(nn.Module):
                 crop_size_w=(w0-1)//2*2+2#能被2整除
             crop_size=(crop_size_h,crop_size_w)#6.6G
         elif(tile_mode>=2):#hw都减半
-            tile_mode=min(min(h0,w0)//128,int(tile_mode))#最小短边为128*128
-            t2=tile_mode*2
-            crop_size=(((h0-1)//t2*t2+t2)//tile_mode,((w0-1)//t2*t2+t2)//tile_mode)
+            safe_limit = max(2, min(h0, w0) // 128)
+            tile_mode = max(2, min(safe_limit, int(tile_mode)))
+            t2 = tile_mode * 2
+            crop_size = (((h0 - 1) // t2 * t2 + t2) // tile_mode, ((w0 - 1) // t2 * t2 + t2) // tile_mode)
         else:
-            print("tile_mode config error")
-            os._exit(233)
+            raise ValueError(f"Invalid tile_mode config: {tile_mode}")
         ph = ((h0 - 1) // crop_size[0] + 1) * crop_size[0]
         pw = ((w0 - 1) // crop_size[1] + 1) * crop_size[1]
         x=F.pad(x,(18,18+pw-w0,18,18+ph-h0),'reflect')
@@ -606,12 +606,12 @@ class UpCunet3x(nn.Module):
                 crop_size_w=(w0-1)//4*4+4#能被2整除
             crop_size=(crop_size_h,crop_size_w)
         elif (tile_mode >= 2):
-            tile_mode=min(min(h0,w0)//128,int(tile_mode))#最小短边为128*128
+            safe_limit = max(2, min(h0, w0) // 128)
+            tile_mode = max(2, min(safe_limit, int(tile_mode)))
             t4 = tile_mode * 4
             crop_size = (((h0 - 1) // t4 * t4 + t4) // tile_mode, ((w0 - 1) // t4 * t4 + t4) // tile_mode)
         else:
-            print("tile_mode config error")
-            os._exit(233)
+            raise ValueError(f"Invalid tile_mode config: {tile_mode}")
         ph = ((h0 - 1) // crop_size[0] + 1) * crop_size[0]
         pw = ((w0 - 1) // crop_size[1] + 1) * crop_size[1]
         x=F.pad(x,(14,14+pw-w0,14,14+ph-h0),'reflect')
@@ -731,12 +731,12 @@ class UpCunet3x(nn.Module):
                 crop_size_w=(w0-1)//4*4+4#能被2整除
             crop_size=(crop_size_h,crop_size_w)
         elif (tile_mode >= 2):
-            tile_mode=min(min(h0,w0)//128,int(tile_mode))#最小短边为128*128
+            safe_limit = max(2, min(h0, w0) // 128)
+            tile_mode = max(2, min(safe_limit, int(tile_mode)))
             t4 = tile_mode * 4
             crop_size = (((h0 - 1) // t4 * t4 + t4) // tile_mode, ((w0 - 1) // t4 * t4 + t4) // tile_mode)
         else:
-            print("tile_mode config error")
-            os._exit(233)
+            raise ValueError(f"Invalid tile_mode config: {tile_mode}")
         ph = ((h0 - 1) // crop_size[0] + 1) * crop_size[0]
         pw = ((w0 - 1) // crop_size[1] + 1) * crop_size[1]
         x=F.pad(x,(14,14+pw-w0,14,14+ph-h0),'reflect')
@@ -938,12 +938,12 @@ class UpCunet4x(nn.Module):
                 crop_size_w=(w0-1)//2*2+2#能被2整除
             crop_size=(crop_size_h,crop_size_w)
         elif (tile_mode >= 2):
-            tile_mode=min(min(h0,w0)//128,int(tile_mode))#最小短边为128*128
+            safe_limit = max(2, min(h0, w0) // 128)
+            tile_mode = max(2, min(safe_limit, int(tile_mode)))
             t2 = tile_mode * 2
             crop_size = (((h0 - 1) // t2 * t2 + t2) // tile_mode, ((w0 - 1) // t2 * t2 + t2) // tile_mode)
         else:
-            print("tile_mode config error")
-            os._exit(233)
+            raise ValueError(f"Invalid tile_mode config: {tile_mode}")
         ph = ((h0 - 1) // crop_size[0] + 1) * crop_size[0]
         pw = ((w0 - 1) // crop_size[1] + 1) * crop_size[1]
         x=F.pad(x,(19,19+pw-w0,19,19+ph-h0),'reflect')
@@ -1075,12 +1075,12 @@ class UpCunet4x(nn.Module):
                 crop_size_w=(w0-1)//2*2+2#能被2整除
             crop_size=(crop_size_h,crop_size_w)
         elif(tile_mode>=2):#hw都减半
-            tile_mode=min(min(h0,w0)//128,int(tile_mode))#最小短边为128*128
-            t2=tile_mode*2
-            crop_size=(((h0-1)//t2*t2+t2)//tile_mode,((w0-1)//t2*t2+t2)//tile_mode)#5.6G
+            safe_limit = max(2, min(h0, w0) // 128)
+            tile_mode = max(2, min(safe_limit, int(tile_mode)))
+            t2 = tile_mode * 2
+            crop_size = (((h0 - 1) // t2 * t2 + t2) // tile_mode, ((w0 - 1) // t2 * t2 + t2) // tile_mode)#5.6G
         else:
-            print("tile_mode config error")
-            os._exit(233)
+            raise ValueError(f"Invalid tile_mode config: {tile_mode}")
         ph = ((h0 - 1) // crop_size[0] + 1) * crop_size[0]
         pw = ((w0 - 1) // crop_size[1] + 1) * crop_size[1]
         x=F.pad(x,(19,19+pw-w0,19,19+ph-h0),'reflect')

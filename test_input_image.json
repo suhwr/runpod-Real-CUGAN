@@ -4,6 +4,6 @@
     "scale": 2,
     "denoise": "conservative",
     "tile_mode": "auto",
-    "upload_destination": "catbox"
+    "upload_destination": "auto"
   }
 }

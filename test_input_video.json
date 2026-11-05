@@ -5,6 +5,6 @@
     "denoise": "conservative",
     "tile_mode": "auto",
     "crf": 18,
-    "upload_destination": "catbox"
+    "upload_destination": "auto"
   }
 }

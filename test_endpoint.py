@@ -44,7 +44,7 @@ def main():
         "scale": args.scale,
         "denoise": args.denoise,
         "tile_mode": args.tile_mode,
-        "upload_destination": "catbox",
+        "upload_destination": "auto",
     }
 
     if args.video:
