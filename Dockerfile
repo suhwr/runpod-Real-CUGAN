@@ -54,8 +54,9 @@ RUN python3 -m pip install --no-cache-dir \
     --extra-index-url https://download.pytorch.org/whl/cu128 \
     -r /app/requirements.txt
 
-# 4. Pre-download Real-CUGAN v3 model weights into image layer
-# Baking models directly eliminates runtime downloads (Zero Cold-Start!)
+# 4. Copy pre-included Real-CUGAN v3 model weights into image layer
+# Having weights pre-committed in repo guarantees instant build (0s network latency)
+COPY weights_v3 /app/weights_v3
 COPY download_models.py /app/download_models.py
 RUN python3 /app/download_models.py
 

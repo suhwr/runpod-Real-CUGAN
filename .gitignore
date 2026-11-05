@@ -30,5 +30,5 @@ tmp/
 *.png
 *.jpg
 *.jpeg
-weights_v3/*.pth
-!weights_v3/.gitkeep
+# Model weights are tracked directly (56MB total, all < 6MB each)
+# weights_v3/*.pth
