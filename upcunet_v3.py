@@ -1292,6 +1292,39 @@ class RealWaifuUpScaler(object):
                 result = self.tensor2np(self.model(tensor,tile_mode,cache_mode,alpha,self.pro))
         return result
 
+    def forward_batch(self, frame_list, tile_mode=0, cache_mode=0, alpha=1.0):
+        """Batch inference for list of HxWx3 uint8 numpy RGB frames."""
+        if not frame_list:
+            return []
+        if len(frame_list) == 1:
+            return [self(frame_list[0], tile_mode, cache_mode, alpha)]
+
+        stacked = np.stack(frame_list, axis=0)  # (B, H, W, 3)
+        t_arr = np.transpose(stacked, (0, 3, 1, 2))  # (B, 3, H, W)
+        tensor = torch.from_numpy(t_arr).to(self.device)
+
+        if self.pro:
+            if not self.half:
+                tensor = tensor.float() / (255.0 / 0.7) + 0.15
+            else:
+                tensor = tensor.half() / (255.0 / 0.7) + 0.15
+        else:
+            if not self.half:
+                tensor = tensor.float() / 255.0
+            else:
+                tensor = tensor.half() / 255.0
+
+        with torch.no_grad():
+            if cache_mode == 3:
+                out = self.model.forward_gap_sync(tensor, tile_mode, alpha, self.pro)
+            elif cache_mode == 2:
+                out = self.model.forward_fast_rough(tensor, tile_mode, alpha, self.pro)
+            else:
+                out = self.model(tensor, tile_mode, cache_mode, alpha, self.pro)
+
+        out_np = np.transpose(out.cpu().numpy(), (0, 2, 3, 1))
+        return [out_np[i] for i in range(len(frame_list))]
+
 if __name__ == "__main__":
     ###########inference_img
     import time, cv2,sys,pdb

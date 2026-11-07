@@ -159,18 +159,49 @@ def determine_tile_mode(width: int, height: int, user_tile_mode=None) -> int:
             pass
 
     pixels = width * height
-    # <= 720p (e.g. 1280x720): tile_mode 0 (single pass, maximum speed)
-    if pixels <= 1280 * 720:
+    # <= 1080p (e.g. 1920x1080): tile_mode 0 (single pass, maximum speed on RunPod GPUs)
+    if pixels <= 1920 * 1080:
         return 0
-    # <= 1080p (e.g. 1920x1080): tile_mode 1 (halves long side, saves 40% VRAM)
-    elif pixels <= 1920 * 1080:
-        return 1
-    # <= 1440p (2K): tile_mode 2 (halves both sides)
+    # <= 1440p (2K): tile_mode 1 (halves long side)
     elif pixels <= 2560 * 1440:
-        return 2
-    # 4K or above: tile_mode 3 or 4 (4x4 tiles, zero OOM risk)
+        return 1
+    # 4K or above: tile_mode 2 or 3
     else:
-        return 3
+        return 2
+
+
+def calculate_cugan_dimensions(in_w: int, in_h: int, target_res: str, user_scale: int = None) -> tuple[int, int, int]:
+    """Calculate target dimensions (even integers) and best model scale."""
+    clean_res = str(target_res).lower().strip()
+    if clean_res in ("720p", "sd"):
+        target_h = 720
+    elif clean_res in ("1080p", "fhd", "hd", "default"):
+        target_h = 1080
+    else:
+        s = user_scale if user_scale in (2, 3, 4) else 2
+        out_w = ((in_w * s) // 2) * 2
+        out_h = ((in_h * s) // 2) * 2
+        return out_w, out_h, s
+
+    if in_w >= in_h:  # Landscape
+        out_h = target_h
+        out_w = int(round(in_w * (target_h / in_h)))
+    else:  # Portrait
+        out_w = target_h
+        out_h = int(round(in_h * (target_h / in_w)))
+
+    out_w = (out_w // 2) * 2
+    out_h = (out_h // 2) * 2
+
+    ratio = max(out_w / max(1, in_w), out_h / max(1, in_h))
+    if ratio <= 2.2:
+        chosen_scale = 2
+    elif ratio <= 3.2:
+        chosen_scale = 3
+    else:
+        chosen_scale = 4
+
+    return out_w, out_h, chosen_scale
 
 
 # ==============================================================================
@@ -486,10 +517,12 @@ def process_video(
     upscaler: RealWaifuUpScaler,
     scale: int,
     tile_mode: int,
+    target_dimensions: tuple[int, int] = None,
     cache_mode: int = 0,
     alpha: float = 1.0,
     crf: int = 18,
     custom_fps: float = None,
+    batch_size: int = 2,
     job_id: str = "cugan-video",
 ) -> dict:
     """
@@ -498,27 +531,56 @@ def process_video(
     Preserves audio streams losslessly with synchronized PTS/DTS timestamps.
     """
     t0 = time.time()
+
+    # 0. Probe input properties
+    probe_cap = cv2.VideoCapture(input_path)
+    if not probe_cap.isOpened():
+        raise ValueError(f"Failed to open video file: {input_path}")
+    raw_w = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_h = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    raw_fps = float(probe_cap.get(cv2.CAP_PROP_FPS))
+    probe_cap.release()
+
+    target_fps = float(custom_fps) if (custom_fps and float(custom_fps) > 0) else 30.0
+
+    # Auto-clamp FPS to 30 unless 60fps explicitly requested (saves 50% GPU time)
+    clamped_temp = None
+    if raw_fps > 35.0 and target_fps <= 30.0:
+        clamped_temp = os.path.join(os.path.dirname(output_path), f"clamped_30fps_{uuid.uuid4().hex[:6]}.mp4")
+        print(f"[{job_id}] Video FPS is {raw_fps:.1f} > 30: clamping to 30 FPS to optimize GPU time...", flush=True)
+        clamp_cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-r", "30",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "15",
+            "-c:a", "copy",
+            clamped_temp
+        ]
+        res = subprocess.run(clamp_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0 and os.path.isfile(clamped_temp) and os.path.getsize(clamped_temp) > 0:
+            input_path = clamped_temp
+            fps = 30.0
+        else:
+            fps = raw_fps
+    else:
+        fps = target_fps if (custom_fps and float(custom_fps) > 0) else (raw_fps if raw_fps > 0 else 24.0)
+
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise ValueError(f"Failed to open video file: {input_path}")
 
     in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    if fps <= 0 or np.isnan(fps):
-        fps = 24.0
-    if custom_fps and custom_fps > 0:
-        fps = float(custom_fps)
-
-    # Force even dimensions for H.264 yuv420p encoder compatibility
-    out_w = ((in_w * scale) // 2) * 2
-    out_h = ((in_h * scale) // 2) * 2
+    if target_dimensions and target_dimensions[0] > 0 and target_dimensions[1] > 0:
+        out_w, out_h = target_dimensions
+    else:
+        out_w = ((in_w * scale) // 2) * 2
+        out_h = ((in_h * scale) // 2) * 2
 
     effective_tile = determine_tile_mode(in_w, in_h, tile_mode)
 
-    print(f"[{job_id}] Video Info: {in_w}x{in_h} @ {fps:.2f}fps ({total_frames} frames) -> Target: {out_w}x{out_h} (scale={scale}x, tile={effective_tile})", flush=True)
+    print(f"[{job_id}] Video Info: {in_w}x{in_h} @ {fps:.2f}fps ({total_frames} frames) -> Target: {out_w}x{out_h} (scale={scale}x, tile={effective_tile}, batch={batch_size})", flush=True)
 
     # 1. Extract audio losslessly to temporary file if audio stream exists
     temp_audio = None
@@ -539,7 +601,6 @@ def process_video(
             if ext_res.returncode == 0 and os.path.isfile(temp_audio) and os.path.getsize(temp_audio) > 0:
                 has_audio = True
             else:
-                # Fallback to AAC transcode
                 extract_cmd_aac = ["ffmpeg", "-y", "-i", input_path, "-vn", "-c:a", "aac", "-b:a", "256k", temp_audio]
                 ext_aac = subprocess.run(extract_cmd_aac, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 if ext_aac.returncode == 0 and os.path.isfile(temp_audio) and os.path.getsize(temp_audio) > 0:
@@ -548,7 +609,6 @@ def process_video(
         print(f"[{job_id}] Audio extraction check failed ({e}), proceeding without audio...", flush=True)
 
     # 2. Build Stage 1 FFmpeg command: encode pure video stream from stdin to temporary file.
-    # Writing pure video without audio avoids libx264 lookahead buffer truncation from pipe -shortest race conditions.
     temp_video = os.path.join(os.path.dirname(output_path), f"temp_video_{uuid.uuid4().hex[:6]}.mp4")
     ffmpeg_cmd = [
         "ffmpeg", "-y",
@@ -561,7 +621,7 @@ def process_video(
         "-an",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "fast",
+        "-preset", "veryfast",
         "-crf", str(crf),
         "-movflags", "+faststart",
         temp_video,
@@ -570,46 +630,63 @@ def process_video(
     print(f"[{job_id}] Launching FFmpeg encoder process (Stage 1: pure video stream)...", flush=True)
     proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    # 3. Stream frames through Real-CUGAN into FFmpeg pipe
+    # 3. Stream frames through Real-CUGAN into FFmpeg pipe in batches
     frames_processed = 0
     t_loop = time.time()
 
     try:
         with torch.inference_mode():
+            batch_rgb = []
             while True:
                 ret, bgr_frame = cap.read()
                 if not ret or bgr_frame is None:
                     break
 
-                rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-                upscaled_rgb = upscaler(rgb_frame, tile_mode=effective_tile, cache_mode=cache_mode, alpha=alpha)
-                upscaled_bgr = cv2.cvtColor(upscaled_rgb, cv2.COLOR_RGB2BGR)
+                batch_rgb.append(cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB))
 
-                # Ensure exact target dimensions match ffmpeg -s {out_w}x{out_h}
-                if upscaled_bgr.shape[0] != out_h or upscaled_bgr.shape[1] != out_w:
-                    upscaled_bgr = cv2.resize(upscaled_bgr, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+                if len(batch_rgb) >= batch_size:
+                    upscaled_list = upscaler.forward_batch(batch_rgb, tile_mode=effective_tile, cache_mode=cache_mode, alpha=alpha)
+                    for upscaled_rgb in upscaled_list:
+                        upscaled_bgr = cv2.cvtColor(upscaled_rgb, cv2.COLOR_RGB2BGR)
+                        if upscaled_bgr.shape[0] != out_h or upscaled_bgr.shape[1] != out_w:
+                            upscaled_bgr = cv2.resize(upscaled_bgr, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+                        try:
+                            proc.stdin.write(upscaled_bgr.tobytes())
+                        except (BrokenPipeError, IOError):
+                            break
+                        frames_processed += 1
+                    batch_rgb.clear()
 
-                # Write raw frame buffer directly to FFmpeg stdin
-                try:
-                    proc.stdin.write(upscaled_bgr.tobytes())
-                except (BrokenPipeError, IOError):
-                    print(f"[{job_id}] FFmpeg pipe closed prematurely.", flush=True)
-                    break
+                    if frames_processed % 30 == 0 or frames_processed >= total_frames:
+                        elapsed = time.time() - t_loop
+                        fps_rate = frames_processed / max(0.001, elapsed)
+                        pct = (frames_processed / max(1, total_frames) * 100)
+                        print(f"[{job_id}] Processed {frames_processed}/{total_frames} frames ({pct:.1f}%) — {fps_rate:.1f} FPS", flush=True)
 
-                frames_processed += 1
-
-                if frames_processed % 30 == 0 or frames_processed == total_frames:
-                    elapsed = time.time() - t_loop
-                    fps_rate = frames_processed / max(0.001, elapsed)
-                    pct = (frames_processed / total_frames * 100) if total_frames > 0 else 0
-                    print(f"[{job_id}] Processed {frames_processed}/{total_frames} frames ({pct:.1f}%) — {fps_rate:.1f} FPS", flush=True)
+            # Flush remainder
+            if batch_rgb:
+                upscaled_list = upscaler.forward_batch(batch_rgb, tile_mode=effective_tile, cache_mode=cache_mode, alpha=alpha)
+                for upscaled_rgb in upscaled_list:
+                    upscaled_bgr = cv2.cvtColor(upscaled_rgb, cv2.COLOR_RGB2BGR)
+                    if upscaled_bgr.shape[0] != out_h or upscaled_bgr.shape[1] != out_w:
+                        upscaled_bgr = cv2.resize(upscaled_bgr, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+                    try:
+                        proc.stdin.write(upscaled_bgr.tobytes())
+                    except (BrokenPipeError, IOError):
+                        break
+                    frames_processed += 1
+                batch_rgb.clear()
 
     finally:
         cap.release()
+        if clamped_temp and os.path.isfile(clamped_temp):
+            try:
+                os.remove(clamped_temp)
+            except Exception:
+                pass
+
         stderr_text = ""
         try:
-            # DO NOT call proc.stdin.close() manually before communicate()!
-            # In Python 3.11+, communicate() automatically flushes and closes stdin cleanly.
             _, stderr_bytes = proc.communicate(timeout=180)
             if stderr_bytes:
                 stderr_text = stderr_bytes.decode("utf-8", errors="ignore")
@@ -725,6 +802,7 @@ def handler(job: dict) -> dict:
     if not raw_media:
         return {"error": "Missing input: provide 'video', 'image', or 'url' in job input payload."}
 
+    target_res = str(job_input.get("resolution", job_input.get("target_resolution", ""))).strip().lower()
     scale = int(job_input.get("scale", 2))
     if scale not in (2, 3, 4):
         scale = 2
@@ -746,6 +824,20 @@ def handler(job: dict) -> dict:
         input_file, detected_type = download_or_decode_media(raw_media, temp_dir)
         print(f"[{job_id}] Input media detected as '{detected_type}' -> {input_file}", flush=True)
 
+        target_dims = None
+        if detected_type == "video":
+            # Probe input dimensions for resolution preset snapping
+            pcap = cv2.VideoCapture(input_file)
+            in_w = int(pcap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            in_h = int(pcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            pcap.release()
+
+            if target_res and target_res in ("720p", "sd", "1080p", "fhd", "hd", "default"):
+                out_w, out_h, chosen_scale = calculate_cugan_dimensions(in_w, in_h, target_res, user_scale=scale)
+                scale = chosen_scale
+                target_dims = (out_w, out_h)
+                print(f"[{job_id}] Target resolution preset '{target_res}' mapped to {out_w}x{out_h} (scale={scale}x)", flush=True)
+
         # 4. Initialize Upscaler
         upscaler = get_upscaler(scale=scale, denoise=denoise, half=half)
 
@@ -758,10 +850,12 @@ def handler(job: dict) -> dict:
                 upscaler=upscaler,
                 scale=scale,
                 tile_mode=tile_mode,
+                target_dimensions=target_dims,
                 cache_mode=cache_mode,
                 alpha=alpha,
                 crf=crf,
                 custom_fps=custom_fps,
+                batch_size=2,
                 job_id=job_id,
             )
             media_type = "video"
