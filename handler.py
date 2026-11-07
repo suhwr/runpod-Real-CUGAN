@@ -832,6 +832,18 @@ def handler(job: dict) -> dict:
             in_h = int(pcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             pcap.release()
 
+            if in_w <= 0 or in_h <= 0:
+                return {"error": "Invalid video stream: could not read dimensions"}
+
+            # Guard: Reject videos already higher than 1080p (> 1090 to account for 1088p encoding)
+            short_edge = min(in_w, in_h)
+            if short_edge > 1090:
+                return {"error": f"Video resolution {in_w}x{in_h} exceeds 1080p limit. Video is already HD (>1080p)."}
+
+            # Guard: If input is sub-720p, enforce target 720p
+            if short_edge < 700:
+                target_res = "720p"
+
             if target_res and target_res in ("720p", "sd", "1080p", "fhd", "hd", "default"):
                 out_w, out_h, chosen_scale = calculate_cugan_dimensions(in_w, in_h, target_res, user_scale=scale)
                 scale = chosen_scale
